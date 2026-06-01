@@ -1,0 +1,963 @@
+const fs = require("fs");
+const path = require("path");
+
+// ================= 配置区 =================
+const INPUT_DIR = path.join(__dirname, "润色"); // 待处理 TXT 所在目录
+const ORIGINAL_ARCHIVE_DIR = path.join(__dirname, "润色（原）"); // 阶段二完成后原文归档目录
+const OUTPUT_DIR = path.join(__dirname, "已润色"); // 结果输出目录
+const API_KEY_FILE = path.join(__dirname, "api0.txt"); // API Key 文件，一行一个
+
+const API_BASE_URL = process.env.SILICONFLOW_BASE_URL || "https://generativelanguage.googleapis.com/v1beta"; // 可改：接口根地址
+const MODEL_ID = process.env.SILICONFLOW_MODEL || "gemini-3-flash-preview"; // 可改：模型 ID
+const IS_GEMINI_STYLE = /generativelanguage\.googleapis\.com/i.test(API_BASE_URL) || /gemini/i.test(MODEL_ID);
+const API_URL = IS_GEMINI_STYLE
+  ? `${API_BASE_URL.replace(/\/$/, "")}/models/${encodeURIComponent(MODEL_ID)}:generateContent`
+  : `${API_BASE_URL.replace(/\/$/, "")}/chat/completions`;
+const MODELS_URL = IS_GEMINI_STYLE
+  ? `${API_BASE_URL.replace(/\/$/, "")}/models`
+  : `${API_BASE_URL.replace(/\/$/, "")}/models`;
+
+const CHUNK_SIZE = 7700; // 可改：主分段字符数
+const MAX_OUTPUT_TOKENS = 8192; // 可改：单次最大输出 Token
+const REQUEST_INTERVAL_MS = 1500; // 可改：分段间隔（毫秒）
+const SPLIT_ALL_CHUNKS_INTO_THREE = true; // 可改：是否将每个分段按逻辑长度补扫成最多 3 个子分段
+const RETRY_DELAYS = [5000, 15000, 30000, 60000, 180000]; // 可改：重试等待时间梯度
+
+const baseDirs = [INPUT_DIR, ORIGINAL_ARCHIVE_DIR, OUTPUT_DIR];
+baseDirs.forEach((dir) => {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+});
+
+function extractApiKey(rawLine) {
+  const line = String(rawLine || "").replace(/^\uFEFF/, "").trim();
+  if (!line || line.startsWith("#") || line.startsWith("//")) return null;
+
+  const match = line.match(/sk-[A-Za-z0-9._-]+|AIza[0-9A-Za-z\-_]+|[A-Za-z0-9][A-Za-z0-9._-]{24,}/);
+  return match ? match[0] : null;
+}
+
+function maskApiKey(key) {
+  if (!key) return "[EMPTY]";
+  if (key.length <= 10) return `${key.slice(0, 4)}***`;
+  return `${key.slice(0, 6)}...${key.slice(-4)}`;
+}
+
+// ================= API Key 读取与轮换 =================
+let apiKeys = [];
+const envApiKey = extractApiKey(process.env.SILICONFLOW_API_KEY || "");
+if (envApiKey) {
+  apiKeys.push(envApiKey);
+}
+
+if (fs.existsSync(API_KEY_FILE)) {
+  const fileKeys = fs
+    .readFileSync(API_KEY_FILE, "utf-8")
+    .split(/\r?\n/)
+    .map((item) => extractApiKey(item))
+    .filter(Boolean);
+
+  apiKeys.push(...fileKeys);
+}
+
+apiKeys = [...new Set(apiKeys)];
+
+let currentKeyIndex = 0;
+function getNextApiKey() {
+  if (apiKeys.length === 0) return null;
+  const key = apiKeys[currentKeyIndex];
+  currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
+  return key;
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function getFormattedTime() {
+  const now = new Date();
+  return `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(
+    now.getDate()
+  ).padStart(2, "0")}${String(now.getHours()).padStart(2, "0")}${String(
+    now.getMinutes()
+  ).padStart(2, "0")}`;
+}
+
+function getUniqueArchivePath(fileName) {
+  const parsed = path.parse(fileName);
+  let candidate = path.join(ORIGINAL_ARCHIVE_DIR, fileName);
+  if (!fs.existsSync(candidate)) return candidate;
+
+  const stamp = getFormattedTime();
+  candidate = path.join(ORIGINAL_ARCHIVE_DIR, `${parsed.name}_${stamp}${parsed.ext}`);
+  return candidate;
+}
+
+// ================= 智能切片 =================
+function getNextChunk(text, startIndex, maxLength = CHUNK_SIZE) {
+  if (startIndex >= text.length) return null;
+
+  let endIndex = Math.min(startIndex + maxLength, text.length);
+  if (endIndex === text.length) {
+    return {
+      text: text.substring(startIndex, endIndex),
+      startIndex,
+      endIndex,
+    };
+  }
+
+  const chunk = text.substring(startIndex, endIndex);
+  let breakPoint = Math.max(
+    chunk.lastIndexOf("。"),
+    chunk.lastIndexOf("！"),
+    chunk.lastIndexOf("？"),
+    chunk.lastIndexOf("”"),
+    chunk.lastIndexOf("\n")
+  );
+
+  if (breakPoint === -1 || breakPoint < maxLength * 0.35) {
+    const lastNewline = chunk.lastIndexOf("\n");
+    if (lastNewline !== -1 && lastNewline > maxLength * 0.25) {
+      breakPoint = lastNewline;
+    }
+  }
+
+  if (breakPoint !== -1 && breakPoint > maxLength * 0.35) {
+    endIndex = startIndex + breakPoint + 1;
+  }
+
+  return {
+    text: text.substring(startIndex, endIndex),
+    startIndex,
+    endIndex,
+  };
+}
+
+function splitTextIntoChunks(text, chunkSize) {
+  const chunks = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    const chunk = getNextChunk(text, cursor, chunkSize);
+    if (!chunk) break;
+    chunks.push(chunk);
+    cursor = chunk.endIndex;
+  }
+  return chunks;
+}
+
+function splitChunkIntoFixedParts(text, partCount) {
+  const safeText = String(text || "");
+  const totalLength = safeText.length;
+  if (!safeText || totalLength === 0) return [];
+
+  const targetCount = Math.max(1, Math.floor(partCount));
+  if (targetCount <= 1) {
+    return [{ text: safeText, startIndex: 0, endIndex: totalLength }];
+  }
+
+  const logicalChunkSize = Math.max(1200, Math.ceil(totalLength / targetCount));
+  const chunks = splitTextIntoChunks(safeText, logicalChunkSize);
+
+  if (chunks.length <= targetCount) {
+    return chunks;
+  }
+
+  const head = chunks.slice(0, targetCount - 1);
+  const tail = chunks.slice(targetCount - 1);
+  const tailStart = tail[0]?.startIndex ?? head[head.length - 1]?.endIndex ?? 0;
+  const tailEnd = tail[tail.length - 1]?.endIndex ?? totalLength;
+
+  return [
+    ...head,
+    {
+      text: safeText.slice(tailStart, tailEnd),
+      startIndex: tailStart,
+      endIndex: tailEnd,
+    },
+  ].filter((item) => item.text);
+}
+
+// ================= Prompt =================
+const SYSTEM_PROMPT = `你是一位拥有二十年经验的资深中文文学翻译家，曾为国内一线出版社（如人民文学出版社、译林出版社、上海译文出版社）翻译过多部畅销外文小说。你的翻译作品以"信、达、雅"著称，深受中国读者喜爱。
+
+## 你的翻译原则
+
+### 忠实与自然
+- 准确传达原文的语义、语气、情感和节奏，不遗漏、不增添原文没有的信息
+- 翻译必须读起来像一位中国作家直接用中文写的小说，而非翻译腔
+- 避免欧化长句，将英文的复杂从句拆分为符合中文阅读习惯的短句
+- 人物对话要符合角色身份、年龄、性格，口语化且鲜活
+
+### 词汇与表达
+- 优先使用当代中国读者熟悉的日常用语，避免生僻词和过度文雅的书面语
+- 严禁堆砌四字成语（如"跌宕起伏""引人入胜""毋庸置疑"），偶尔自然使用即可
+- 禁止使用以下AI高频词汇和句式：
+  · "值得注意的是""不可否认""毫无疑问""事实上""总而言之""综上所述"
+  · "令人叹为观止""恰如其分""应运而生""如火如荼""与此同时"
+  · "不仅……而且……""无论……都……"等过度工整的关联词组合
+  · "这不禁让人……""这无疑是……"等评论式插入语
+  · "“此外”、“然而”、“值得注意的是”、“不可否认”等生硬的书面语
+  ·“以此以此”、“等等等等”、“非常非常”、“某种”等明显啰嗦重复的词语
+- 形容词和副词要克制，不过度渲染情绪
+- 比喻和修辞保留原文的意象，必要时转化为中国读者能理解的等效表达
+
+### 句式与结构
+- 句子长度参差错落，长短句自然交替，营造阅读节奏
+- 段落之间过渡自然，不使用"首先""其次""最后"等机械连接词
+- 保持原文的段落划分，不自行合并或拆分段落
+- 叙述视角、时态与原文保持一致
+
+### 对话处理
+- 对话使用中文双引号""
+- 根据角色特点赋予不同的说话风格和用词习惯
+- 语气词（"嗯""啊""呢""吧""嘛"）适当使用，不过度
+
+### 专有名词
+- 人名：首次出现时注入术语表，翻译中文译名，强制统一译法
+- 地名：有通行译名的用通行译名，注入术语表，强制统一译法
+- 品牌、书名、歌曲名等：有官方中文名的用官方名
+
+### 格式要求
+- 仅输出译文，不输出任何解释、注释、译者按语或元评论
+- 不要在译文前后添加任何说明性文字
+- 保留原文的章节标题格式。请对输入文本做“必要且明确”的润色记录抽取，只输出 JSON 对象，格式必须是 {"modifications":[...]}。
+
+执行要求：
+- 尽量找全“明确可改”的问题，不要只挑最前面的几处
+- 不得改剧情、设定、事实与人物关系
+- 不确定时可以不改，但明显问题不要漏掉
+- old_text 必须与原文完全一致
+- new_text 可以为空字符串，表示删除
+- 没有修改时返回 {"modifications":[]}
+- 每个 modification 必须包含 old_text、new_text、reason
+- 不要输出 Markdown，不要解释，不要代码块，只返回 JSON`;
+
+function cleanModelText(text) {
+  return String(text || "")
+    .replace(/```json/gi, "")
+    .replace(/```/g, "")
+    .trim();
+}
+
+function extractLikelyJson(text) {
+  const cleanText = cleanModelText(text);
+  const firstBrace = cleanText.indexOf("{");
+  const lastBrace = cleanText.lastIndexOf("}");
+
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    return cleanText.slice(firstBrace, lastBrace + 1);
+  }
+
+  return cleanText;
+}
+
+function extractResponseContent(data) {
+  const openAIContent = data?.choices?.[0]?.message?.content;
+  if (typeof openAIContent === "string") return openAIContent;
+  if (Array.isArray(openAIContent)) {
+    return openAIContent
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (item && typeof item === "object" && typeof item.text === "string") return item.text;
+        return "";
+      })
+      .join("");
+  }
+
+  const geminiParts = data?.candidates?.[0]?.content?.parts;
+  if (Array.isArray(geminiParts)) {
+    return geminiParts
+      .map((part) => (part && typeof part.text === "string" ? part.text : ""))
+      .join("");
+  }
+
+  return "";
+}
+
+function parseModelModifications(rawContent) {
+  const result = {
+    modifications: [],
+    parsed: false,
+    rawContent: rawContent || "",
+  };
+
+  const likelyJson = extractLikelyJson(rawContent);
+
+  try {
+    const parsed = JSON.parse(likelyJson);
+    if (Array.isArray(parsed)) {
+      result.modifications = parsed;
+    } else if (parsed && Array.isArray(parsed.modifications)) {
+      result.modifications = parsed.modifications;
+    }
+    result.parsed = true;
+    return result;
+  } catch (error) {
+    const matches = likelyJson.match(/\{[\s\S]*?"old_text"[\s\S]*?"new_text"[\s\S]*?"reason"[\s\S]*?\}/g) || [];
+    const rescued = [];
+
+    for (const item of matches) {
+      try {
+        rescued.push(JSON.parse(item));
+      } catch (e) {}
+    }
+
+    result.modifications = rescued;
+    result.parsed = rescued.length > 0;
+    return result;
+  }
+}
+
+function sanitizeModifications(chunkText, aiMods) {
+  const validMods = [];
+  const seen = new Set();
+
+  for (const mod of aiMods || []) {
+    if (!mod) continue;
+    if (typeof mod.old_text !== "string") continue;
+    if (typeof mod.new_text !== "string") continue; // 允许空字符串，表示删除
+    if (typeof mod.reason !== "string") mod.reason = "【未分类】";
+    if (!mod.old_text) continue;
+    if (!chunkText.includes(mod.old_text)) continue;
+    if (mod.old_text === mod.new_text) continue;
+    if (mod.reason.includes("无需修改")) continue;
+
+    const key = `${mod.old_text}>>>${mod.new_text}>>>${mod.reason}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    validMods.push({
+      old_text: mod.old_text,
+      new_text: mod.new_text,
+      reason: mod.reason.trim() || "【未分类】",
+    });
+  }
+
+  return validMods;
+}
+
+function resolveModificationPositions(chunkText, chunkStartIndex, mods, chunkIndex) {
+  const occupiedRanges = [];
+  const cursors = new Map();
+  const positioned = [];
+
+  for (const mod of mods) {
+    let searchFrom = cursors.get(mod.old_text) || 0;
+    let localIndex = chunkText.indexOf(mod.old_text, searchFrom);
+
+    while (localIndex !== -1) {
+      const candidateStart = localIndex;
+      const candidateEnd = localIndex + mod.old_text.length;
+      const overlaps = occupiedRanges.some(
+        (range) => candidateStart < range.end && candidateEnd > range.start
+      );
+
+      if (!overlaps) break;
+      localIndex = chunkText.indexOf(mod.old_text, localIndex + 1);
+    }
+
+    if (localIndex === -1) {
+      localIndex = chunkText.indexOf(mod.old_text);
+    }
+
+    if (localIndex === -1) continue;
+
+    const localEnd = localIndex + mod.old_text.length;
+    occupiedRanges.push({ start: localIndex, end: localEnd });
+    cursors.set(mod.old_text, localEnd);
+
+    positioned.push({
+      ...mod,
+      chunkIndex,
+      absoluteStart: chunkStartIndex + localIndex,
+      absoluteEnd: chunkStartIndex + localEnd,
+    });
+  }
+
+  return positioned;
+}
+
+function getModKey(mod) {
+  return [
+    mod.absoluteStart,
+    mod.absoluteEnd,
+    mod.old_text,
+    mod.new_text,
+    mod.reason,
+  ].join("::");
+}
+
+function mergeUniqueMods(existingMods, incomingMods) {
+  const merged = [...existingMods];
+  const seen = new Set(existingMods.map(getModKey));
+
+  for (const mod of incomingMods) {
+    const key = getModKey(mod);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(mod);
+  }
+
+  return merged;
+}
+
+async function rescueChunkByParts(chunkInfo, chunkIndex) {
+  const subChunks = splitChunkIntoFixedParts(chunkInfo.text, 3);
+  if (!SPLIT_ALL_CHUNKS_INTO_THREE || subChunks.length <= 1) {
+    return null;
+  }
+
+  console.log(`   🛟 分段 ${chunkIndex} 补扫：按逻辑长度拆成 ${subChunks.length} 个子分段`);
+  let allMods = [];
+  let combinedRaw = "";
+  let parsedAny = false;
+  let usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+
+  for (let i = 0; i < subChunks.length; i++) {
+    const sub = subChunks[i];
+    console.log(`      ↳ 子分段 ${chunkIndex}.${i + 1}/${subChunks.length}：${sub.text.length} 字符`);
+    const subResult = await callPolishingModel(sub.text);
+    const positioned = resolveModificationPositions(
+      sub.text,
+      chunkInfo.startIndex + sub.startIndex,
+      subResult.validMods,
+      chunkIndex
+    );
+    allMods = mergeUniqueMods(allMods, positioned);
+    combinedRaw += `\n[sub ${i + 1}]\n${subResult.rawContent || ""}`;
+    parsedAny = parsedAny || subResult.parsed;
+    usage.prompt_tokens += subResult.usage?.prompt_tokens || 0;
+    usage.completion_tokens += subResult.usage?.completion_tokens || 0;
+    usage.total_tokens += subResult.usage?.total_tokens || 0;
+  }
+
+  return {
+    validMods: allMods,
+    rawContent: combinedRaw.trim(),
+    parsed: parsedAny,
+    usage,
+  };
+}
+
+function ensureFetchAvailable() {
+  if (typeof fetch !== "function") {
+    throw new Error(
+      '当前 Node 环境没有全局 fetch。请使用 Node 18+，或先执行：npm install undici，然后在脚本顶部引入 const { fetch } = require("undici");'
+    );
+  }
+}
+
+async function validateApiKey(apiKey) {
+  const response = await fetch(MODELS_URL, {
+    method: "GET",
+    headers: IS_GEMINI_STYLE
+      ? {
+          "x-goog-api-key": apiKey,
+        }
+      : {
+          Authorization: `Bearer ${apiKey}`,
+        },
+  });
+
+  const rawText = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`KEY_VALIDATE_${response.status}: ${rawText.slice(0, 500)}`);
+  }
+
+  let data = null;
+  try {
+    data = JSON.parse(rawText);
+  } catch (error) {}
+
+  const modelList = IS_GEMINI_STYLE
+    ? Array.isArray(data?.models)
+      ? data.models.map((item) => item.name).filter(Boolean)
+      : []
+    : Array.isArray(data?.data)
+      ? data.data.map((item) => item.id).filter(Boolean)
+      : [];
+
+  return {
+    ok: true,
+    status: response.status,
+    rawText,
+    modelList,
+  };
+}
+
+async function preflightCheck() {
+  ensureFetchAvailable();
+
+  if (apiKeys.length === 0) {
+    throw new Error("未读取到任何有效 API Key。请检查 api0.txt 或 SILICONFLOW_API_KEY。");
+  }
+
+  console.log(`\n🔐 [预检] 共读取到 ${apiKeys.length} 个 API Key`);
+  console.log(`🌐 [预检] API_BASE_URL: ${API_BASE_URL}`);
+  console.log(`📡 [预检] 目标模型: ${MODEL_ID}`);
+
+  let validatedCount = 0;
+  let hasModelAccess = false;
+  const failures = [];
+
+  for (let i = 0; i < apiKeys.length; i++) {
+    const apiKey = apiKeys[i];
+    const masked = maskApiKey(apiKey);
+
+    try {
+      process.stdout.write(`   [预检] 校验 Key ${i + 1}/${apiKeys.length}: ${masked}\r`);
+      const result = await validateApiKey(apiKey);
+      validatedCount++;
+
+      const supportsModel = result.modelList.length === 0 || result.modelList.includes(MODEL_ID);
+      if (supportsModel) hasModelAccess = true;
+
+      console.log(`   ✅ Key 可用: ${masked}${supportsModel ? " | 已含目标模型或模型列表不可见" : " | 未在模型列表中看到目标模型"}`);
+    } catch (error) {
+      failures.push({ masked, message: error.message });
+      console.log(`   ❌ Key 失效: ${masked} | ${error.message}`);
+    }
+  }
+
+  if (validatedCount === 0) {
+    const detail = failures.map((item) => `${item.masked}: ${item.message}`).join("\n");
+    throw new Error(`所有 API Key 预检失败。\n${detail}`);
+  }
+
+  if (!hasModelAccess) {
+    console.log(`   ⚠️ 预检提示：已验证到可用 Key，但模型列表里未明确看到 ${MODEL_ID}`);
+    console.log("   ⚠️ 这通常意味着：模型名写错、账号无权限、或该接口未返回完整模型列表。");
+  }
+}
+
+async function requestChatCompletion(apiKey, chunkText, useJsonMode = true) {
+  const payload = IS_GEMINI_STYLE
+    ? {
+        systemInstruction: {
+          parts: [{ text: SYSTEM_PROMPT }],
+        },
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: `待润色文本：\n${chunkText}` }],
+          },
+        ],
+        generationConfig: {
+          temperature: 0,
+          maxOutputTokens: MAX_OUTPUT_TOKENS,
+          responseMimeType: "application/json",
+        },
+      }
+    : {
+        model: MODEL_ID,
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: `待润色文本：\n${chunkText}` },
+        ],
+        temperature: 0,
+        max_tokens: MAX_OUTPUT_TOKENS,
+        stream: false,
+      };
+
+  if (useJsonMode && !IS_GEMINI_STYLE) {
+    payload.response_format = { type: "json_object" };
+  }
+
+  const headers = IS_GEMINI_STYLE
+    ? {
+        "x-goog-api-key": apiKey,
+        "Content-Type": "application/json",
+      }
+    : {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      };
+
+  const response = await fetch(API_URL, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(payload),
+  });
+
+  const responseText = await response.text();
+
+  if (!response.ok) {
+    if (!IS_GEMINI_STYLE && useJsonMode && response.status === 400 && /response_format|json_object/i.test(responseText)) {
+      return requestChatCompletion(apiKey, chunkText, false);
+    }
+
+    if (response.status === 401) {
+      throw new Error(`401 Unauthorized: ${responseText.slice(0, 500)}`);
+    }
+
+    if (response.status === 403) {
+      throw new Error(`403 Forbidden: ${responseText.slice(0, 500)}`);
+    }
+
+    if (response.status === 404) {
+      throw new Error(`404 Not Found: ${responseText.slice(0, 500)}`);
+    }
+
+    if (response.status === 429) {
+      throw new Error("429 Too Many Requests");
+    }
+
+    throw new Error(`HTTP ${response.status}: ${responseText.slice(0, 500)}`);
+  }
+
+  let data;
+  try {
+    data = JSON.parse(responseText);
+  } catch (error) {
+    throw new Error(`返回体不是合法 JSON：${responseText.slice(0, 300)}`);
+  }
+
+  return data;
+}
+
+// ================= 核心 AI 调用 =================
+async function callPolishingModel(chunkText) {
+  let attempt = 0;
+
+  while (attempt <= RETRY_DELAYS.length) {
+    const apiKey = getNextApiKey();
+    if (!apiKey) {
+      console.error("❌ 错误：未找到有效的 API Key！");
+      return {
+        validMods: [],
+        rawContent: "",
+        parsed: false,
+        usage: null,
+      };
+    }
+
+    try {
+      process.stdout.write(`   [AI处理中] 正在请求模型... 当前 Key: ${maskApiKey(apiKey)}\r`);
+
+      const data = await requestChatCompletion(apiKey, chunkText, true);
+      const rawContent = extractResponseContent(data);
+      const usage = data?.usage || null;
+
+      process.stdout.write(
+        `   [AI处理中] 返回字符: ${String(rawContent.length).padEnd(6, " ")}\r`
+      );
+      console.log("\n   ✅ 接收完成！");
+
+      const parsed = parseModelModifications(rawContent);
+      const validMods = sanitizeModifications(chunkText, parsed.modifications);
+
+      return {
+        validMods,
+        rawContent,
+        parsed: parsed.parsed,
+        usage,
+      };
+    } catch (error) {
+      const message = String(error?.message || error);
+      const fatalAuthError = /401 Unauthorized|403 Forbidden|404 Not Found/i.test(message);
+      const rateLimited = /429 Too Many Requests/i.test(message);
+
+      if (fatalAuthError) {
+        console.log(`\n   ❌ 检测到不可重试错误：${message}`);
+        throw error;
+      }
+
+      if (attempt < RETRY_DELAYS.length) {
+        const waitSeconds = RETRY_DELAYS[attempt] / 1000;
+        if (rateLimited && apiKeys.length > 1) {
+          console.log(
+            `\n   ⚠️ 触发 429 限流，已自动轮换到下一个 API Key。${waitSeconds} 秒后进行第 ${attempt + 1} 次重试...`
+          );
+        } else {
+          console.log(
+            `\n   ⚠️ API异常 (${message})，${waitSeconds} 秒后进行第 ${attempt + 1} 次重试...`
+          );
+        }
+        await sleep(RETRY_DELAYS[attempt]);
+        attempt++;
+      } else {
+        console.log(`\n   ❌ 连续重试 ${RETRY_DELAYS.length} 次失败。`);
+        throw error;
+      }
+    }
+  }
+
+  return {
+    validMods: [],
+    rawContent: "",
+    parsed: false,
+    usage: null,
+  };
+}
+
+// ================= 阶段一：提取修改建议 =================
+async function processAndPolishChunks() {
+  await preflightCheck();
+
+  const files = fs.readdirSync(INPUT_DIR).filter((f) => f.endsWith(".txt"));
+  if (files.length === 0) {
+    console.log("没有找到需要处理的文件。");
+    return;
+  }
+
+  for (const file of files) {
+    const baseName = path.parse(file).name;
+    console.log(`\n📚 [阶段一] 启动小说任务: 《${baseName}》`);
+
+    const filePath = path.join(INPUT_DIR, file);
+    const text = fs.readFileSync(filePath, "utf-8");
+    if (!text || text.trim() === "") continue;
+
+    const totalChars = text.length;
+    const bookOutputDir = path.join(OUTPUT_DIR, baseName);
+    const debugDir = path.join(bookOutputDir, "_debug_raw");
+    if (!fs.existsSync(bookOutputDir)) fs.mkdirSync(bookOutputDir, { recursive: true });
+    if (!fs.existsSync(debugDir)) fs.mkdirSync(debugDir, { recursive: true });
+
+    const posFile = path.join(bookOutputDir, `${baseName}_定位记录.json`);
+    const proofFile = path.join(bookOutputDir, `${baseName}_校对记录.txt`);
+    const jsonDataFile = path.join(bookOutputDir, `${baseName}_润色数据.json`);
+    const usageFile = path.join(bookOutputDir, `${baseName}_调用统计.log`);
+
+    let lastIndex = 0;
+    let currentChunkIndex = 0;
+    let globalAppliedCount = 1;
+
+    if (fs.existsSync(posFile)) {
+      const posData = JSON.parse(fs.readFileSync(posFile, "utf-8"));
+
+      if (posData.fileName && posData.fileName !== file) {
+        console.log(`\n⚠️ 警告：定位记录中的文件名与当前文件不一致（记录=${posData.fileName}，当前=${file}），已跳过该文件。`);
+        continue;
+      }
+
+      if (posData.totalChars !== totalChars) {
+        console.log("\n⚠️ 警告：检测到源文件字符数已变化，为避免错位替换，已跳过该文件。");
+        continue;
+      }
+
+      lastIndex = posData.lastIndex || 0;
+      currentChunkIndex = posData.currentChunkIndex || 0;
+      console.log(
+        `[断点续传] 检测到同文件名未完成任务，已从第 ${currentChunkIndex + 1} 分段继续（字符位置 ${lastIndex}/${totalChars}）`
+      );
+
+      if (fs.existsSync(proofFile)) {
+        const existingLog = fs.readFileSync(proofFile, "utf-8");
+        const matches = [...existingLog.matchAll(/(?:^|\n)(\d+)\./g)];
+        if (matches.length > 0) {
+          globalAppliedCount = Number(matches[matches.length - 1][1]) + 1;
+        }
+      }
+    } else {
+      const header =
+        "=======================================\n" +
+        `小说《${baseName}》润色记录单\n` +
+        `模型：${MODEL_ID}\n` +
+        "说明：已启用小分片、非流式 JSON、位置替换、调试落盘。\n" +
+        "=======================================\n\n";
+
+      fs.writeFileSync(proofFile, header, "utf-8");
+      fs.writeFileSync(jsonDataFile, "[]", "utf-8");
+      fs.writeFileSync(usageFile, `模型: ${MODEL_ID}\n\n`, "utf-8");
+      fs.writeFileSync(
+        posFile,
+        JSON.stringify(
+          {
+            fileName: file,
+            totalChars,
+            lastIndex: 0,
+            currentChunkIndex: 0,
+            lastUpdated: new Date().toISOString(),
+          },
+          null,
+          4
+        ),
+        "utf-8"
+      );
+    }
+
+    while (lastIndex < totalChars) {
+      const chunkInfo = getNextChunk(text, lastIndex, CHUNK_SIZE);
+      if (!chunkInfo) break;
+
+      currentChunkIndex++;
+      const chunkText = chunkInfo.text;
+      const progressPercent = ((chunkInfo.startIndex / totalChars) * 100).toFixed(2);
+      console.log(
+        `\n   ---[分段 ${currentChunkIndex}] 进度: ${progressPercent}% (字符位置: ${chunkInfo.startIndex}/${totalChars}，分段长度: ${chunkText.length}) ---`
+      );
+
+      let result = await callPolishingModel(chunkText);
+      let positionedMods = resolveModificationPositions(
+        chunkText,
+        chunkInfo.startIndex,
+        result.validMods,
+        currentChunkIndex
+      );
+
+      if (SPLIT_ALL_CHUNKS_INTO_THREE) {
+        const rescued = await rescueChunkByParts(chunkInfo, currentChunkIndex);
+        if (rescued && rescued.validMods.length > positionedMods.length) {
+          result = rescued;
+          positionedMods = rescued.validMods;
+        }
+      }
+
+      const usageLine = [
+        `chunk=${currentChunkIndex}`,
+        `chars=${chunkText.length}`,
+        `mods=${positionedMods.length}`,
+        `prompt_tokens=${result.usage?.prompt_tokens ?? "?"}`,
+        `completion_tokens=${result.usage?.completion_tokens ?? "?"}`,
+        `total_tokens=${result.usage?.total_tokens ?? "?"}`,
+      ].join(" | ");
+      fs.appendFileSync(usageFile, `${usageLine}\n`, "utf-8");
+
+      if (!result.parsed || (result.rawContent && positionedMods.length === 0)) {
+        const debugPath = path.join(debugDir, `chunk_${String(currentChunkIndex).padStart(4, "0")}.txt`);
+        fs.writeFileSync(debugPath, result.rawContent || "[EMPTY RESPONSE]", "utf-8");
+      }
+
+      if (positionedMods.length > 0) {
+        const existingJson = JSON.parse(fs.readFileSync(jsonDataFile, "utf-8"));
+        const merged = mergeUniqueMods(existingJson, positionedMods);
+        fs.writeFileSync(jsonDataFile, JSON.stringify(merged, null, 4), "utf-8");
+
+        let logBuffer = "";
+        for (const mod of positionedMods) {
+          const newTextStr = mod.new_text === "" ? "(已删除)" : mod.new_text;
+          console.log(`"${mod.old_text}"`);
+          console.log(`${mod.reason} =`);
+          console.log(`"${newTextStr}"\n`);
+
+          logBuffer += `${globalAppliedCount++}. ${mod.reason}\n`;
+          logBuffer += `   原文: ${mod.old_text}\n`;
+          logBuffer += `   校正: ${newTextStr}\n`;
+          logBuffer += `   位置: ${mod.absoluteStart} - ${mod.absoluteEnd}\n`;
+          logBuffer += `   分段: ${mod.chunkIndex}\n\n`;
+        }
+        fs.appendFileSync(proofFile, logBuffer, "utf-8");
+      } else {
+        console.log("[提示] 该分段没有可靠修改数据。");
+      }
+
+      lastIndex = chunkInfo.endIndex;
+      fs.writeFileSync(
+        posFile,
+        JSON.stringify(
+          {
+            fileName: file,
+            totalChars,
+            lastIndex,
+            currentChunkIndex,
+            lastUpdated: new Date().toISOString(),
+          },
+          null,
+          4
+        ),
+        "utf-8"
+      );
+
+      await sleep(REQUEST_INTERVAL_MS);
+    }
+
+    console.log(`\n🎉 阶段一完成！《${baseName}》 所有分段已扫描完毕。`);
+  }
+}
+
+// ================= 阶段二：按位置安全合成最终文本 =================
+async function mergeAndArchive() {
+  const files = fs.readdirSync(INPUT_DIR).filter((f) => f.endsWith(".txt"));
+  if (files.length === 0) {
+    console.log("没有找到源文件，或已全部合并完成。");
+    return;
+  }
+
+  for (const file of files) {
+    const baseName = path.parse(file).name;
+    const bookOutputDir = path.join(OUTPUT_DIR, baseName);
+    if (!fs.existsSync(bookOutputDir)) continue;
+
+    const jsonDataFile = path.join(bookOutputDir, `${baseName}_润色数据.json`);
+    const sourceFilePath = path.join(INPUT_DIR, file);
+
+    if (!fs.existsSync(jsonDataFile)) {
+      console.log(`[跳过] 找不到《${baseName}》的润色数据，请先运行阶段一。`);
+      continue;
+    }
+
+    console.log(`\n🚀 [阶段二] 正在应用修改并合成最终文本: 《${baseName}》`);
+
+    let fullText = fs.readFileSync(sourceFilePath, "utf-8");
+    const allMods = JSON.parse(fs.readFileSync(jsonDataFile, "utf-8"))
+      .filter(
+        (mod) =>
+          Number.isInteger(mod.absoluteStart) &&
+          Number.isInteger(mod.absoluteEnd) &&
+          typeof mod.old_text === "string" &&
+          typeof mod.new_text === "string"
+      )
+      .sort((a, b) => {
+        if (b.absoluteStart !== a.absoluteStart) return b.absoluteStart - a.absoluteStart;
+        return b.old_text.length - a.old_text.length;
+      });
+
+    let replaceCount = 0;
+    let skipCount = 0;
+
+    for (const mod of allMods) {
+      const currentSlice = fullText.slice(mod.absoluteStart, mod.absoluteEnd);
+      if (currentSlice !== mod.old_text) {
+        skipCount++;
+        continue;
+      }
+
+      fullText =
+        fullText.slice(0, mod.absoluteStart) +
+        mod.new_text +
+        fullText.slice(mod.absoluteEnd);
+      replaceCount++;
+    }
+
+    console.log(`   ✅ 精确替换 ${replaceCount} 处，跳过错位 ${skipCount} 处。`);
+
+    const timestamp = getFormattedTime();
+    const finalContentPath = path.join(bookOutputDir, `${baseName}_最终排版_${timestamp}.txt`);
+    fs.writeFileSync(finalContentPath, fullText, "utf-8");
+
+    const archivePath = getUniqueArchivePath(file);
+    fs.renameSync(sourceFilePath, archivePath);
+
+    console.log(`🎉 处理完成！最终文本已保存至: ${finalContentPath}`);
+    console.log(`📦 原文件已归档至: ${archivePath}`);
+  }
+}
+
+// ================= 执行菜单 =================
+const args = process.argv.slice(2);
+
+if (args[0] === "1") {
+  processAndPolishChunks();
+} else if (args[0] === "2") {
+  mergeAndArchive();
+} else if (args[0] === "test") {
+  preflightCheck().catch((error) => {
+    console.error("\n❌ 预检失败：", error.message || error);
+    process.exitCode = 1;
+  });
+} else {
+  console.log(`
+=========================================
+      智能小说润色系统（稳态修正版）
+=========================================
+默认模型：${MODEL_ID}
+建议模型：gemini-3-flash-preview
+默认地址：${API_BASE_URL}
+默认分段：${CHUNK_SIZE} 字符
+可选覆盖：SILICONFLOW_MODEL=你的模型名 node runse.js 1
+可选地址：SILICONFLOW_BASE_URL=https://api.siliconflow.com/v1
+
+👉 仅做鉴权预检：node runse.js test
+👉 运行阶段一（检索提取，断点续传）：node runse.js 1
+👉 运行阶段二（按位置替换，原件归档）：node runse.js 2
+    `);
+}
