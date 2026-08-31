@@ -131,9 +131,10 @@ const smartChunking = (text: string, targetSize: number = 1000, _margin: number 
   const chunks: { originalText: string, previousTextContext: string }[] = [];
   if (!text) return chunks;
 
-  // 1. 根据目标字数计算需要分成的总块数，从而得到更平均的基准字数 (avgSize)
-  const totalChunks = Math.max(1, Math.ceil(text.length / targetSize));
-  const avgSize = Math.floor(text.length / totalChunks);
+  // 1. 防御非法输入：0/负数/NaN 会让 avgSize 归零、切割游标停滞导致死循环冻结页面
+  const safeSize = Math.max(100, Math.floor(targetSize) || 100);
+  const totalChunks = Math.max(1, Math.ceil(text.length / safeSize));
+  const avgSize = Math.max(1, Math.floor(text.length / totalChunks));
 
   // 2. 预处理安全点：绝对不能在引号内部进行切割
   const isSafe = new Uint8Array(text.length);
@@ -1164,9 +1165,9 @@ export default function AudiobookWorkstation() {
       keyStatesRef.current = keys.map(key => ({ key, isRateLimited: false, cooldownUntil: 0 }));
     }
     
-    while (isRunningRef.current || isRunningTtsRef.current || isManual) {
+    const scanOnce = (): string | null => {
       const now = Date.now();
-      let foundKey = null;
+      let foundKey: KeyRuntimeState | null = null;
       let startIndex = lastUsedKeyIndexRef.current + 1;
       
       for(let i = 0; i < keys.length; i++) {
@@ -1183,8 +1184,18 @@ export default function AudiobookWorkstation() {
       }
       saveKeyStates();
       
-      if (foundKey) return foundKey.key;
+      return foundKey ? foundKey.key : null;
+    };
+    
+    // 手动操作（单句重合成 / Level 3 逐句合成）在流水线未运行时也必须能立即拿到可用 Key
+    const immediateKey = scanOnce();
+    if (immediateKey) return immediateKey;
+    
+    while (isRunningRef.current || isRunningTtsRef.current || isManual) {
+      const found = scanOnce();
+      if (found) return found;
       
+      const now = Date.now();
       const earliestKey = [...keyStatesRef.current].sort((a, b) => a.cooldownUntil - b.cooldownUntil)[0];
       const waitTime = Math.max(1000, earliestKey.cooldownUntil - now);
       addLog(`等待 ${Math.round(waitTime/1000)}秒以解除 429 限流...`, "warn");
@@ -1311,8 +1322,8 @@ ${chunkText}
           char: seg.char || "旁白",
           speaker_id: seg.speaker_id,
           speaker_alias: seg.speaker_alias,
-          voice: seg.voice || castData?.cast.find(c => c.character_name === seg.char || c.speaker_alias === seg.char)?.assigned_voice_id || 
-                 castData?.cast.find(c => c.speaker_id === "NARRATOR")?.assigned_voice_id || "Aoede",
+          voice: seg.voice || castDataArg?.cast.find(c => c.character_name === seg.char || c.speaker_alias === seg.char)?.assigned_voice_id || 
+                 castDataArg?.cast.find(c => c.speaker_id === "NARRATOR")?.assigned_voice_id || "Aoede",
           char_in_cast: seg.char_in_cast,
           char_inferred: seg.char_inferred,
           emotion_class: seg.emotion_class || "calm",
@@ -1352,7 +1363,7 @@ ${chunkText}
         if (trimmed.length > 0 && !trimmed.startsWith('[')) {
           segments.push({
             char: "旁白",
-            voice: castData?.cast.find(c => c.character_name === "旁白" || c.speaker_id === "NARRATOR")?.assigned_voice_id || "Aoede",
+            voice: castDataArg?.cast.find(c => c.character_name === "旁白" || c.speaker_id === "NARRATOR")?.assigned_voice_id || "Aoede",
             emotion_class: "calm",
             audio_tag: "Calm narration with steady pacing",
             text: trimmed
@@ -1520,6 +1531,21 @@ ${chunkText}
 
     const handleRetrySelectedChunks = async () => {
     if (selectedChunkIds.size === 0) return addLog("请先勾选需要补扫的分块", "warn");
+    
+    let currentCastData = castData;
+    if (castJsonStr.trim()) {
+      try {
+        currentCastData = JSON.parse(castJsonStr);
+      } catch {
+        addLog("❌ Cast JSON 格式解析失败！请检查拼写、逗号或括号。", "error");
+        return;
+      }
+    }
+    if (!currentCastData || !currentCastData.cast || currentCastData.cast.length === 0) {
+      addLog("❌ Cast JSON 配置错误或缺少 cast 数组！", "error");
+      return;
+    }
+    
     addLog(`启动人工补扫，共 ${selectedChunkIds.size} 块...`, "info");
       
     for (const chunkId of Array.from(selectedChunkIds)) {
@@ -1532,7 +1558,7 @@ ${chunkText}
         const key = await getAvailableKey(true);
         if (!key) throw new Error("无可用 Key");
           
-        const segments = await callGeminiFlash(chunks[chunkIdx].originalText, chunks[chunkIdx].previousTextContext, key);
+        const segments = await callGeminiFlash(chunks[chunkIdx].originalText, chunks[chunkIdx].previousTextContext, key, currentCastData);
           
         setChunks(prev => prev.map(c => c.id === chunkId ? { ...c, status: 'success', segments } : c));
         setSelectedChunkIds(prev => {
@@ -1603,7 +1629,9 @@ ${chunkText}
 
         allSegs.push({
           ...seg,
-          seq: seg.seq || seqCounter++,
+          // LLM 返回的 seq 只是分块内局部编号，必须无条件全局重编号
+          // 否则跨分块 seq 冲突会覆盖音频缓存并打乱时间轴，整书拼接必然失败
+          seq: seqCounter++,
           chapter: seg.chapter || extractChapter(seg.text),
           type: seg.type || (titleFlag ? "chapter_title" : "content"),
           speaker_id: seg.speaker_id || entry.speaker_id,
@@ -1796,8 +1824,14 @@ ${chunkText}
   // ==========================================
   const sliceAndValidateBatch = async (wavBlob: Blob, batch: TTSBatch): Promise<{ seq: number; blob: Blob; url: string; fallbackLevel?: number }[]> => {
     const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-    const arrayBuffer = await wavBlob.arrayBuffer();
-    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+    let audioBuffer: AudioBuffer;
+    try {
+      const arrayBuffer = await wavBlob.arrayBuffer();
+      audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+    } finally {
+      // 浏览器并发 AudioContext 有硬上限（约 6 个），用完必须关闭，否则长篇多批次后 decodeAudioData 抛异常中断流水线
+      audioContext.close().catch(() => {});
+    }
     const channelData = audioBuffer.getChannelData(0);
     const sampleRate = audioBuffer.sampleRate;
     
