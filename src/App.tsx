@@ -342,7 +342,13 @@ const emotionDescriptions: Record<string, string> = {
   fear: "颤抖、恐惧且慌张",
   fearful: "颤抖、恐惧且慌张",
   happy: "高亢、喜悦且兴奋",
-  tense: "紧绷、紧张且局促"
+  tense: "紧绷、紧张且局促",
+  // 补全提示词 emotion_class 枚举中存在但此处缺失的 4 种情绪，
+  // 缺失时它们会退化为"温和、平静且自然"的默认朗读
+  excited: "高亢、激动且充满张力",
+  solemn: "庄重、严肃且沉稳",
+  whisper: "气声、低语且刻意压低音量",
+  neutral: "平静、自然且克制，不带明显感情色彩"
 };
 
 const getSpeakerColor = (speakerName: string, cast: CastMember[]) => {
@@ -790,7 +796,12 @@ export default function AudiobookWorkstation() {
               } catch {}
             }
             if (savedState.chunks) setChunks(savedState.chunks);
-            if (savedState.ttsBatches) setTtsBatches(savedState.ttsBatches);
+            // blob: URL 无法跨页面会话存活，刷新后从持久化的 Blob 重建
+            if (savedState.ttsBatches) setTtsBatches(savedState.ttsBatches.map((b: TTSBatch) => ({
+              ...b,
+              audioUrl: b.audioBlob ? URL.createObjectURL(b.audioBlob) : undefined,
+              slicedAudios: b.slicedAudios?.map(s => ({ ...s, url: URL.createObjectURL(s.blob) })),
+            })));
             if (savedState.globalSegments) setGlobalSegments(savedState.globalSegments);
             if (savedState.modelName) setModelName(savedState.modelName);
             if (savedState.ttsModelName) setTtsModelName(savedState.ttsModelName);
@@ -972,9 +983,24 @@ export default function AudiobookWorkstation() {
   // ==========================================
   // 多项目历史任务管理核心逻辑
   // ==========================================
+  // 统一释放当前工程持有的全部音频资源（ObjectURL 与播放器缓存），
+  // 供新建/切换/清空工程时调用；blob URL 不 revoke 会钉住底层音频内存，长篇项目切换几次即累积数百 MB
+  const releaseAllAudioResources = () => {
+    Object.values(audioPlayersRef.current).forEach(p => p.pause());
+    audioPlayersRef.current = {};
+    ttsBatches.forEach(b => {
+      if (b.audioUrl) URL.revokeObjectURL(b.audioUrl);
+      if (b.slicedAudios) b.slicedAudios.forEach(s => URL.revokeObjectURL(s.url));
+    });
+    globalSequencedUrls.forEach(url => URL.revokeObjectURL(url));
+    if (masterAudioUrl) URL.revokeObjectURL(masterAudioUrl);
+  };
+
   const createNewProject = () => {
     const newId = `proj_${Date.now()}`;
     const now = Date.now();
+    
+    releaseAllAudioResources();
     
     setRawText('');
     setNovelFileName('');
@@ -1013,6 +1039,9 @@ export default function AudiobookWorkstation() {
       setProjectId(targetId);
       localStorage.setItem('audiolab_projectId', targetId);
       
+      // 先释放上一个工程占用的音频资源，防止项目间来回切换累积泄漏
+      releaseAllAudioResources();
+      
       setRawText(savedState.rawText || '');
       setNovelFileName(savedState.novelFileName || '');
       setCastJsonStr(savedState.castJsonStr || '');
@@ -1020,7 +1049,12 @@ export default function AudiobookWorkstation() {
         setCastData(JSON.parse(savedState.castJsonStr));
       } catch { setCastData(null); }
       setChunks(savedState.chunks || []);
-      setTtsBatches(savedState.ttsBatches || []);
+      // 持久化的 blob: URL 在页面刷新或项目切换后已失效，必须从 Blob 重新生成 URL
+      setTtsBatches((savedState.ttsBatches || []).map((b: TTSBatch) => ({
+        ...b,
+        audioUrl: b.audioBlob ? URL.createObjectURL(b.audioBlob) : undefined,
+        slicedAudios: b.slicedAudios?.map(s => ({ ...s, url: URL.createObjectURL(s.blob) })),
+      })));
       setGlobalSegments(savedState.globalSegments || []);
       if (savedState.pipelinePhase) setPipelinePhase(savedState.pipelinePhase);
       if (savedState.chunkSize) setChunkSize(savedState.chunkSize);
@@ -1452,8 +1486,9 @@ ${chunkText}
           throw new Error("模型未输出任何有效剧本标签");
         }
 
-        // 校验 2: 对越界说话人做 Fallback 映射
-        const validSpeakers = ['旁白', 'Narrator', 'NARRATOR', ...(castData?.cast.flatMap(c => [c.character_name, c.speaker_id, c.character_name_en, c.speaker_alias, ...(c.aliases || [])].filter(Boolean) as string[]) || [])];
+        // 校验 2: 对越界说话人做 Fallback 映射（用当次解析的 currentCastData 而非渲染闭包里的 castData，
+        // 长流水线运行期间用户改动 Cast JSON 时避免新旧角色表混用）
+        const validSpeakers = ['旁白', 'Narrator', 'NARRATOR', ...(currentCastData?.cast.flatMap(c => [c.character_name, c.speaker_id, c.character_name_en, c.speaker_alias, ...(c.aliases || [])].filter(Boolean) as string[]) || [])];
         const unknownSet = new Set<string>();
         segments.forEach(s => {
           if (!validSpeakers.includes(s.char)) {
@@ -1462,7 +1497,7 @@ ${chunkText}
               unknownSet.add(s.char);
             }
             s.char = '旁白';
-            s.voice = castData?.cast.find(c => c.character_name === '旁白' || c.speaker_id === 'NARRATOR')?.assigned_voice_id || 'Aoede';
+            s.voice = currentCastData?.cast.find(c => c.character_name === '旁白' || c.speaker_id === 'NARRATOR')?.assigned_voice_id || 'Aoede';
           }
         });
 
@@ -1925,6 +1960,14 @@ ${chunkText}
         }));
     
     if (!resume) {
+      // 全新合成会整体丢弃旧批次资源，先释放其 ObjectURL 与播放器缓存，
+      // 防止长篇反复重跑时数百个 blob URL 钉住音频内存持续增长
+      Object.values(audioPlayersRef.current).forEach(p => p.pause());
+      audioPlayersRef.current = {};
+      ttsBatches.forEach(b => {
+        if (b.audioUrl) URL.revokeObjectURL(b.audioUrl);
+        if (b.slicedAudios) b.slicedAudios.forEach(s => URL.revokeObjectURL(s.url));
+      });
       setTtsBatches(activeBatches);
     }
     
@@ -1988,8 +2031,9 @@ ${batch.text}`;
     setIsRunningTts(false);
     isRunningTtsRef.current = false;
     
-    const allDone = ttsBatches.every(b => b.status === 'success');
-    if (allDone || ttsBatches.every(b => b.status === 'success' || b.status === 'failed')) {
+    // activeBatches 的元素引用与循环内 setState 的突变共享，
+    // 用它判定完成状态；渲染时闭包里的 ttsBatches 是旧快照，永远判定不出"全部完成"
+    if (activeBatches.every(b => b.status === 'success' || b.status === 'failed')) {
        setPipelinePhase('tts');
        setWorkspaceTab('master');
     }
@@ -2019,8 +2063,19 @@ ${seg.text}`;
       // 写入 IndexedDB 缓存
       await db.set('audios', `${projectId}_${seq}`, blob);
 
+      // 销毁旧播放器：缓存的 HTMLAudioElement 仍持有旧 blob URL，不清理会继续播放修改前的音频
+      const oldPlayer = audioPlayersRef.current[seq];
+      if (oldPlayer) {
+        oldPlayer.pause();
+        delete audioPlayersRef.current[seq];
+      }
+
       setGlobalSequencedAudios(prev => new Map(prev).set(seq, blob));
-      setGlobalSequencedUrls(prev => new Map(prev).set(seq, url));
+      setGlobalSequencedUrls(prev => {
+        const oldUrl = prev.get(seq);
+        if (oldUrl) URL.revokeObjectURL(oldUrl);
+        return new Map(prev).set(seq, url);
+      });
       
       addLog(`✅ 对白 [seq:${seq}] 单句合成并更新完成。`, "success");
     } catch (err: any) {
@@ -2067,13 +2122,19 @@ ${seg.text}`;
         slices.push({ seq, blob, url, fallbackLevel: 3 });
       }
       
-      setTtsBatches(prev => prev.map(b => b.id === batchId ? { 
-        ...b, 
-        status: 'success',
-        slicedAudios: slices,
-        audioBlob: undefined,
-        audioUrl: undefined
-      } : b));
+      setTtsBatches(prev => prev.map(b => {
+        if (b.id !== batchId) return b;
+        // 被替换的旧批次资源不再被任何状态引用（逐句新 URL 已在上面写入），统一释放
+        if (b.audioUrl) URL.revokeObjectURL(b.audioUrl);
+        if (b.slicedAudios) b.slicedAudios.forEach(s => URL.revokeObjectURL(s.url));
+        return { 
+          ...b, 
+          status: 'success',
+          slicedAudios: slices,
+          audioBlob: undefined,
+          audioUrl: undefined
+        };
+      }));
       
       addLog(`✅ Batch [${batchId}] Level 3 逐句单独重合成成功！共合成 ${slices.length} 个片段。`, "success");
     } catch (err) {
@@ -2099,10 +2160,9 @@ ${seg.text}`;
       setGlobalSegments([]);
       setGlobalSequencedAudios(new Map());
       
-      globalSequencedUrls.forEach(url => URL.revokeObjectURL(url));
+      releaseAllAudioResources();
       setGlobalSequencedUrls(new Map());
       
-      if (masterAudioUrl) URL.revokeObjectURL(masterAudioUrl);
       setMasterAudioBlob(null);
       setMasterAudioUrl(null);
       setPipelinePhase('setup');
